@@ -1,284 +1,87 @@
-# -*- coding: utf-8 -*-
-#
-# Copyright 2019-2021 Arne Köhn <arne@chark.eu>
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+run := poetry run
 
-# Instructions:
-# - if you edit a command running python, make sure to
-#   write . $(VENV) && python3 -- this sets up the virtual environment.
-#   if you just write "python3 foo.py" without the ". $(VENV) && " before,
-#   the libraries will not be loaded during run time.
-# - all targets running python somewhere should have venv/bin/activate as a dependency.
-#   this makes sure that all required packages are installed.
-# - Disable bibtex etc. targets by setting NOBIB=true (for debugging etc.)
-#   (e.g., make -j4 NOBIB=true)
-
-SHELL := /bin/bash
-
-# If you want to host the anthology on your own, set ANTHOLOGY_PREFIX
-# in your call to make to your prefix, e.g.
-#
-#     ANTHOLOGY_PREFIX="https://mirror.myhost.com/anthology" make
-#
-# PLEASE NOTE that the prefix cannot contain any '#' character, or a Perl regex
-# below will fail.
-# The following line ensures that it is exported as an environment variable
-# for all sub-processes:
-
-export ANTHOLOGY_PREFIX ?= https://aclanthology.org
-
-SLASHATEND:=$(shell echo ${ANTHOLOGY_PREFIX} | grep -q '/$$'; echo $$?)
-
-ifeq (${SLASHATEND},0)
-  $(error ANTHOLOGY_PREFIX is not allowed to have a slash at the end.)
-endif
-
-# hugo wants to know the host and base dir on its own, so
-# we sed the prefix into those parts.
-ANTHOLOGYHOST := $(shell echo "${ANTHOLOGY_PREFIX}" | sed 's|\(https*://[^/]*\).*|\1|')
-ANTHOLOGYDIR := $(shell echo "${ANTHOLOGY_PREFIX}" | sed 's|https*://[^/]*/\(.*\)|\1|')
-
-# the regexp above only matches if we actually have a subdirectory.
-# make the dir empty if only a tld was provided as the prefix.
-ifeq ($(ANTHOLOGY_PREFIX),$(ANTHOLOGYDIR))
-  ANTHOLOGYDIR :=
-endif
-
-# Root location for PDF and attachment hierarchy.
-# This is the directory where you have to put all the papers and attachments.
-# Easiest if the server can just serve them from /anthology-files.
-ANTHOLOGYFILES ?= /var/www/anthology-files
-
-HUGO_ENV ?= production
-
-sourcefiles=$(shell find data -type f '(' -name "*.yaml" -o -name "*.xml" ')')
-xmlstaged=$(shell git diff --staged --name-only --diff-filter=d data/xml/*.xml)
-pysources=$(shell git ls-files | egrep "\.pyi?$$")
-pystaged=$(shell git diff --staged --name-only  --diff-filter=d | egrep "\.pyi?$$")
-
-# these are shown in the generated html so everyone knows when the data
-# was generated.
-timestamp=$(shell date -u +"%d %B %Y at %H:%M %Z")
-githash=$(shell git rev-parse HEAD)
-githashshort=$(shell git rev-parse --short HEAD)
-
-#######################################################
-# check whether the correct python version is available
-ifeq (, $(shell which python3 ))
-  $(error "python3 not found in $(PATH)")
-endif
-
-PYTHON_VERSION_MIN=3.8
-PYTHON_VERSION_OK=$(shell python3 -c 'import sys; (major, minor) = "$(PYTHON_VERSION_MIN)".split("."); print(sys.version_info.major==int(major) and sys.version_info.minor >= int(minor))' )
-
-ifeq ($(PYTHON_VERSION_OK),"False")
-  PYTHON_VERSION=$(shell python3 -c 'import sys; print("%d.%d"% sys.version_info[0:2])' )
-  $(error "Need python $(PYTHON_VERSION_MIN), but only found python $(PYTHON_VERSION)!")
-endif
-# end python check
-#######################################################
-
-# hugo version check
-HUGO_VERSION_MIN=126
-HUGO_VERSION=$(shell hugo version | sed 's/^.* v0\.\(.*\)\..*/\1/')
-HUGO_VERSION_TOO_LOW:=$(shell [[ $(HUGO_VERSION_MIN) -gt $(HUGO_VERSION) ]] && echo true)
-ifeq ($(HUGO_VERSION_TOO_LOW),true)
-  $(error "incorrect hugo version installed! Need hugo 0.$(HUGO_VERSION_MIN), but only found hugo 0.$(HUGO_VERSION)!")
-endif
-
-
-VENV := "venv/bin/activate"
-
-.PHONY: site
-site: build/.hugo build/.sitemap
-
-
-# Split the file sitemap into Google-ingestible chunks.
-# Also build the PDF sitemap, and split it.
-.PHONY: sitemap
-sitemap: build/.sitemap
-
-build/.sitemap: venv/bin/activate build/.hugo
-	. $(VENV) && python3 bin/split_sitemap.py build/website/$(ANTHOLOGYDIR)/sitemap.xml
-	@rm -f build/website/$(ANTHOLOGYDIR)/sitemap_*.xml.gz
-	@gzip -9n build/website/$(ANTHOLOGYDIR)/sitemap_*.xml
-	@bin/create_sitemapindex.sh `ls build/website/$(ANTHOLOGYDIR)/ | grep 'sitemap_.*xml.gz'` > build/website/$(ANTHOLOGYDIR)/sitemapindex.xml
-	@touch build/.sitemap
-
-.PHONY: venv
-venv: venv/bin/activate
-
-# installs dependencies if requirements.txt have been updated.
-venv/bin/activate: bin/requirements.txt
-	test -d venv || python3 -m venv venv
-	. $(VENV) && pip3 install wheel
-	. $(VENV) && pip3 install -Ur bin/requirements.txt
-	touch venv/bin/activate
+### Most common targets for developing
 
 .PHONY: all
-all: check site
+all: check test docs
 
-.PHONY: basedirs
-basedirs:
-	build/.basedirs
-
-build/.basedirs:
-	@mkdir -p build/data-export
-	@mkdir -p build/content/papers
-	@touch build/.basedirs
-
-# copies all files that are not automatically generated
-# and creates empty directories as needed.
-.PHONY: static
-static: build/.static
-
-build/.static: build/.basedirs $(shell find hugo -type f)
-	@echo "INFO     Creating and populating build directory..."
-	@echo "INFO     Split ${ANTHOLOGY_PREFIX} into HOST=${ANTHOLOGYHOST} DIR=${ANTHOLOGYDIR}"
-	@cp -r hugo/* build
-	@echo >> build/config.toml
-	@echo "[params]" >> build/config.toml
-	@echo "  githash = \"${githash}\"" >> build/config.toml
-	@echo "  githashshort = \"${githashshort}\"" >> build/config.toml
-	@echo "  timestamp = \"${timestamp}\"" >> build/config.toml
-	@perl -pi -e "s|ANTHOLOGYDIR|$(ANTHOLOGYDIR)|g" build/website/index.html
-	@touch build/.static
-
-.PHONY: hugo_data
-hugo_data: build/.data
-
-build/.data: build/.basedirs $(sourcefiles) venv/bin/activate
-	@echo "INFO     Generating data files for Hugo..."
-	. $(VENV) && python3 bin/create_hugo_data.py --clean
-	@touch build/.data
-
-.PHONY: bib
-bib:	build/.bib
-
-#######################################################
-# Disable citation targets (except for 3 bibtex per volume) by setting NOBIB=true
-ifeq (true, $(NOBIB))
-$(info WARNING: not creating full citation materials; this is not suitable for release!)
-build/.bib:
-	@touch build/.bib
-else
-
-build/.bib: build/.basedirs build/.data venv/bin/activate
-	@echo "INFO     Creating extra bibliographic files..."
-	. $(VENV) && python3 bin/create_extra_bib.py --clean
-	@touch build/.bib
-endif
-# end if block to conditionally disable bibtex generation
-#######################################################
-
-.PHONY: hugo
-hugo: build/.hugo
-
-build/.hugo: build/.static build/.data build/.bib
-	@echo "INFO     Running Hugo... this may take a while."
-	@cd build && \
-	    hugo -b $(ANTHOLOGYHOST)/$(ANTHOLOGYDIR) \
-	         -d website/$(ANTHOLOGYDIR) \
-		 -e $(HUGO_ENV) \
-	         --cleanDestinationDir \
-	         --minify \
-		 --logLevel=info
-	@cd build/website/$(ANTHOLOGYDIR) \
-	    && ln -s $(ANTHOLOGYFILES) anthology-files \
-	    && perl -i -pe 's|ANTHOLOGYDIR|$(ANTHOLOGYDIR)|g' .htaccess
-	@touch build/.hugo
-
-.PHONY: mirror
-mirror: venv/bin/activate
-	. $(VENV) && bin/create_mirror.py data/xml/*xml
-
-.PHONY: mirror-no-attachments
-mirror-no-attachments: venv/bin/activate
-	. $(VENV) && bin/create_mirror.py --only-papers data/xml/*xml
+.PHONY: check
+check: pre-commit typecheck
 
 .PHONY: test
-test: hugo
-	diff -u build/website/$(ANTHOLOGYDIR)/P19-1007.bib test/data/P19-1007.bib
-	diff -u build/website/$(ANTHOLOGYDIR)/P19-1007.xml test/data/P19-1007.xml
+test: pytest
+
+.PHONY: fix-and-test
+fix-and-test: pre-commit-autofix typecheck pytest
+
+### Package setup
+
+.PHONY: dependencies
+dependencies: .flag_installed
+.flag_installed: pyproject.toml poetry.lock
+	poetry install --with dev
+	@touch .flag_installed
+
+.PHONY: install-hooks
+install-hooks: .git/hooks/pre-commit
+.git/hooks/pre-commit: .flag_installed .pre-commit-config.yaml
+	$(run) pre-commit install
 
 .PHONY: clean
 clean:
-	rm -rf build venv
+	@for folder in .mypy_cache/ .ruff_cache/ .pytest_cache/ dist/ site/; do \
+	  if [[ -d "$$folder" ]]; then \
+	    rm -rfv "$$folder" ; \
+	  fi; \
+	done
+	@find . -type d -name __pycache__ -exec rm -rfv "{}" +
+	@poetry run pre-commit uninstall
+	@poetry env remove --all -n
+	@rm -fv coverage.xml .flag_installed
 
-.PHONY: check
-check: venv
-	@if grep -rl '	' data/xml; then \
-	    echo "check error: found a tab character in the above XML files!"; \
-	    exit 1; \
-	fi
-	jing -c data/xml/schema.rnc data/xml/*xml
-	. $(VENV) \
-	  && SKIP=no-commit-to-branch pre-commit run --all-files \
-	  && black --check $(pysources) \
-	  && ruff check $(pysources)
+### Check, test, build commands
 
-.PHONY: check_staged_xml
-check_staged_xml:
-	@if [ ! -z "$(xmlstaged)" ]; then \
-	     jing -c data/xml/schema.rnc $(xmlstaged) ;\
-	 fi
+.PHONY: test-integration
+test-integration: .flag_installed
+	$(run) pytest -m "integration" --cov=acl_anthology --cov-report=xml
 
-.PHONY: check_commit
-check_commit: check_staged_xml venv/bin/activate
-	@. $(VENV) && pre-commit run
-	@if [ ! -z "$(pystaged)" ]; then \
-	    . $(VENV) && black --check $(pystaged) && ruff check $(pystaged) ;\
-	 fi
+.PHONY: pytest
+pytest: .flag_installed
+	$(run) pytest -m "not integration" --cov=acl_anthology --cov-report=xml
 
-.PHONY: autofix
-autofix: check_staged_xml venv/bin/activate
-	 @. $(VENV) && \
-	 EXIT_STATUS=0 ;\
-	 pre-commit run || EXIT_STATUS=$$? ;\
-	 PRE_DIFF=`git diff --no-ext-diff --no-color` ;\
-	 ruff check --fix --show-fixes $(pysources) || EXIT_STATUS=$$? ;\
-	 black $(pysources) || EXIT_STATUS=$$? ;\
-	 POST_DIFF=`git diff --no-ext-diff --no-color` ;\
-	 [ "$${PRE_DIFF}" = "$${POST_DIFF}" ] || EXIT_STATUS=1 ;\
-	 [ $${EXIT_STATUS} -eq 0 ]
+.PHONY: typecheck
+typecheck: .flag_installed
+	$(run) mypy acl_anthology
 
-.PHONY: reformat
-reformat: autofix
+.PHONY: pre-commit
+pre-commit: .flag_installed
+	$(run) pre-commit run --all-files
 
-.PHONY: serve
-serve:
-	 @echo "INFO     Starting a server at http://localhost:8000/"
-	 @cd build/website && python3 -m http.server 8000
+# Runs pre-commit twice in case of failure, so that it will pass the second time
+# if only auto-fixing hooks have triggered
+.PHONY: pre-commit-autofix
+pre-commit-autofix: .flag_installed
+	@$(run) pre-commit run --all-files || $(run) pre-commit run --all-files
 
-# Main site: aclanthology.org. Requires ANTHOLOGYDIR to be unset.
-.PHONY: upload
-upload:
-	@if [[ "$(ANTHOLOGYDIR)" != "" ]]; then \
-            echo "WARNING: Can't upload because ANTHOLOGYDIR was set to '${ANTHOLOGYDIR}' instead of being empty"; \
-            exit 1; \
-        fi
-	@echo "INFO     Running rsync for main site (aclanthology.org)..."
-	@rsync -aze "ssh -o StrictHostKeyChecking=accept-new" --delete build/website/ anthologizer@aclanthology.org:/var/www/aclanthology.org
+.PHONY: test-all-python-versions
+test-all-python-versions:
+	@for py in 3.10 3.11 3.12 3.13; do \
+	  poetry env use $$py ; \
+	  poetry install --with dev --quiet ; \
+	  poetry run pytest -m "not integration" ; \
+	done
 
-# Push a preview to the mirror
-.PHONY: preview
-preview:
-	make --version
-	@if [[ "$(ANTHOLOGYDIR)" != "" ]]; then \
-	  echo "INFO     Running rsync for the '$(ANTHOLOGYDIR)' branch preview..."; \
-	  rsync -aze "ssh -o StrictHostKeyChecking=accept-new" build/website/${ANTHOLOGYDIR}/ anthologizer@aclanthology.org:/var/www/preview.aclanthology.org/${ANTHOLOGYDIR}; \
-	else \
-	  echo "FATAL    ANTHOLOGYDIR must contain the preview name, but was empty"; \
-	  exit 1; \
-	fi
+#.PHONY: autofix
+#autofix: .flag_installed
+#	$(run) black acl_anthology/ tests/
+#	$(run) ruff check --fix-only acl_anthology/ tests/
+
+### Documentation
+
+.PHONY: docs
+docs: .flag_installed
+	$(run) mkdocs build
+
+.PHONY: docs-serve
+docs-serve: .flag_installed
+	$(run) mkdocs serve
